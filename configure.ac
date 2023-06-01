@@ -285,7 +285,7 @@ fi
 if test "$tests" = yes; then
 
 # Look for gtest.
-PKG_CHECK_MODULES([GTEST], [gtest_main])
+PKG_CHECK_MODULES([GTEST], [gtest gtest_main])
 
 
 # Look for rapidcheck.
@@ -294,7 +294,7 @@ AC_ARG_VAR([RAPIDCHECK_HEADERS], [include path of gtest headers shipped by RAPID
 AC_LANG_PUSH(C++)
 AC_SUBST(RAPIDCHECK_HEADERS)
 [CXXFLAGS="-I $RAPIDCHECK_HEADERS $CXXFLAGS"]
-[LIBS="-lrapidcheck -lgtest $LIBS"]
+[LIBS="-lrapidcheck $GTEST_LIBS $LIBS"]
 AC_CHECK_HEADERS([rapidcheck/gtest.h], [], [], [#include <gtest/gtest.h>])
 dnl AC_CHECK_LIB doesn't work for C++ libs with mangled symbols
 AC_LINK_IFELSE([
