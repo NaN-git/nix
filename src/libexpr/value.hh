@@ -280,11 +280,6 @@ public:
 
     void mkStringMove(const char * s, const NixStringContext & context);
 
-    inline void mkString(const Symbol & s)
-    {
-        mkString(((const std::string &) s).c_str());
-    }
-
     void mkPath(const SourcePath & path);
 
     inline void mkPath(const char * path)
