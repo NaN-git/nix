@@ -159,7 +159,11 @@ ref<Aws::Client::ClientConfiguration> S3Helper::makeConfig(
 S3Helper::FileTransferResult S3Helper::getObject(
     const std::string & bucketName, const std::string & key)
 {
-    debug("fetching 's3://%s/%s'...", bucketName, key);
+    std::string uri = "s3://" + bucketName + "/" + key;
+    Activity act(*logger, lvlTalkative, actFileTransfer,
+        fmt("downloading '%s'", uri),
+        {uri}, getCurActivity());
+    debug("fetching '%s'...", uri);
 
     auto request =
         Aws::S3::Model::GetObjectRequest()
@@ -179,6 +183,8 @@ S3Helper::FileTransferResult S3Helper::getObject(
         auto result = checkAws(fmt("AWS error fetching '%s'", key),
             client->GetObject(request));
 
+        auto size = result.GetContentLength();
+        act.progress(size, size);
         res.data = decompress(result.GetContentEncoding(),
             dynamic_cast<std::stringstream &>(result.GetBody()).str());
 
@@ -306,19 +312,32 @@ struct S3BinaryCacheStoreImpl : virtual S3BinaryCacheStoreConfig, public virtual
     std::shared_ptr<TransferManager> transferManager;
     std::once_flag transferManagerCreated;
 
+    struct AsyncContext : public Aws::Client::AsyncCallerContext
+    {
+        std::shared_ptr<Activity> act;
+
+        AsyncContext(const std::shared_ptr<Activity> & act) : act(act) {}
+    };
+
     void uploadFile(const std::string & path,
         std::shared_ptr<std::basic_iostream<char>> istream,
         const std::string & mimeType,
         const std::string & contentEncoding)
     {
+        std::string uri = "s3://" + bucketName + "/" + path;
+        auto act = std::make_shared<Activity>(*logger, lvlTalkative, actFileTransfer,
+            fmt("uploading '%s'", uri),
+            Logger::Fields{uri}, getCurActivity());
         istream->seekg(0, istream->end);
         auto size = istream->tellg();
         istream->seekg(0, istream->beg);
+        act->progress(0, size);
 
         auto maxThreads = std::thread::hardware_concurrency();
 
         static std::shared_ptr<Aws::Utils::Threading::PooledThreadExecutor>
             executor = std::make_shared<Aws::Utils::Threading::PooledThreadExecutor>(maxThreads);
+        static Sync<std::unordered_set<std::shared_ptr<Aws::Transfer::TransferHandle>>> outstandingHandles{};
 
         std::call_once(transferManagerCreated, [&]()
         {
@@ -333,15 +352,29 @@ struct S3BinaryCacheStoreImpl : virtual S3BinaryCacheStoreConfig, public virtual
                         const std::shared_ptr<const TransferHandle>
                         &transferHandle)
                     {
-                        //FIXME: find a way to properly abort the multipart upload.
-                        //checkInterrupt();
+                        auto done = transferHandle->GetBytesTransferred();
+                        auto total = transferHandle->GetBytesTotalSize();
+                        auto context = std::dynamic_pointer_cast<const AsyncContext>(transferHandle->GetContext());
+                        context->act->progress(done, total);
                         debug("upload progress ('%s'): '%d' of '%d' bytes",
-                            transferHandle->GetKey(),
-                            transferHandle->GetBytesTransferred(),
-                            transferHandle->GetBytesTotalSize());
+                            transferHandle->GetKey(), done, total);
                     };
 
                 transferManager = TransferManager::Create(transferConfig);
+                executor->Submit([&, transferManager = this->transferManager]() {
+                    while (true) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        auto handles = outstandingHandles.lock();
+                        try {
+                            checkInterrupt();
+                        } catch (...) {
+                            for (auto & handle : *handles) {
+                                transferManager->AbortMultipartUpload(handle);
+                            }
+                            handles->clear();
+                        }
+                    }
+                });
             }
         });
 
@@ -352,13 +385,20 @@ struct S3BinaryCacheStoreImpl : virtual S3BinaryCacheStoreConfig, public virtual
             if (contentEncoding != "")
                 throw Error("setting a content encoding is not supported with S3 multi-part uploads");
 
+            auto context = std::make_shared<AsyncContext>(act);
             std::shared_ptr<TransferHandle> transferHandle =
                 transferManager->UploadFile(
                     istream, bucketName, path, mimeType,
                     Aws::Map<Aws::String, Aws::String>(),
-                    nullptr /*, contentEncoding */);
+                    context /*, contentEncoding */);
+            {
+                auto handles = outstandingHandles.lock();
+                checkInterrupt();
+                handles->emplace(transferHandle);
+            }
 
             transferHandle->WaitUntilFinished();
+            outstandingHandles.lock()->erase(transferHandle);
 
             if (transferHandle->GetStatus() == TransferStatus::FAILED)
                 throw Error("AWS error: failed to upload 's3://%s/%s': %s",
@@ -375,6 +415,14 @@ struct S3BinaryCacheStoreImpl : virtual S3BinaryCacheStoreConfig, public virtual
                 .WithBucket(bucketName)
                 .WithKey(path);
 
+            request.SetContinueRequestHandler([](const Aws::Http::HttpRequest*) {
+                bool cont = false;
+                try {
+                    checkInterrupt();
+                    cont = true;
+                } catch(...) {}
+                return cont;
+            });
             request.SetContentType(mimeType);
 
             if (contentEncoding != "")
@@ -385,6 +433,7 @@ struct S3BinaryCacheStoreImpl : virtual S3BinaryCacheStoreConfig, public virtual
             auto result = checkAws(fmt("AWS error uploading '%s'", path),
                 s3Helper.client->PutObject(request));
         }
+        act->progress(size, size);
 
         auto now2 = std::chrono::steady_clock::now();
 
