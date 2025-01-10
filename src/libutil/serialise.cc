@@ -212,10 +212,12 @@ std::unique_ptr<FinishSink> sourceToSink(std::function<void(Source &)> fun)
         }
 
         std::string_view cur;
+        const size_t maxChunkSize = 1 << 15;
 
         void operator () (std::string_view in) override
         {
             if (in.empty()) return;
+            if (!cur.empty()) { unreachable(); }
             cur = in;
 
             if (!coro) {
@@ -227,8 +229,7 @@ std::unique_ptr<FinishSink> sourceToSink(std::function<void(Source &)> fun)
                                 throw EndOfFile("coroutine has finished");
                         }
 
-                        size_t n = std::min(cur.size(), out_len);
-                        memcpy(out, cur.data(), n);
+                        auto n = cur.copy(out, std::min(out_len, maxChunkSize));
                         cur.remove_prefix(n);
                         return n;
                     });
@@ -245,8 +246,10 @@ std::unique_ptr<FinishSink> sourceToSink(std::function<void(Source &)> fun)
 
         void finish() override
         {
-            if (coro && *coro)
+            if (coro && *coro) {
                 (*coro)(true);
+            }
+            coro.reset();
         }
     };
 
@@ -271,33 +274,45 @@ std::unique_ptr<Source> sinkToSource(
         {
         }
 
-        std::string cur;
+        std::unique_ptr<std::string> cur;
         size_t pos = 0;
+        const size_t maxChunkSize = 1 << 15;
 
         size_t read(char * data, size_t len) override
         {
             if (!coro) {
                 coro = coro_t::pull_type([&](coro_t::push_type & yield) {
                     LambdaSink sink([&](std::string_view data) {
-                        if (!data.empty()) yield(std::string(data));
+                        for (size_t i = 0; i < data.size(); i += maxChunkSize) {
+                            yield(std::string(data.substr(i, maxChunkSize)));
+                        }
                     });
                     fun(sink);
                 });
             }
 
-            if (!*coro) { eof(); unreachable(); }
+            if (!*coro) {
+                coro.reset();
+                cur.reset();
+                eof();
+                unreachable();
+            }
 
-            if (pos == cur.size()) {
-                if (!cur.empty()) {
+            if (!cur || pos >= cur->size()) {
+                if (pos == std::string::npos) {
                     (*coro)();
                 }
-                cur = coro->get();
+                cur = std::make_unique<std::string>(coro->get());
                 pos = 0;
             }
 
-            auto n = std::min(cur.size() - pos, len);
-            memcpy(data, cur.data() + pos, n);
+            auto n = cur->copy(data, len, pos);
             pos += n;
+
+            if (pos == cur->size()) {
+                cur.reset();
+                pos = std::string::npos;
+            }
 
             return n;
         }
